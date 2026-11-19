@@ -3,6 +3,8 @@ run:
 	PYTHONPATH=src:. $(PY) -m recallnotice.cli
 run_inc:
 	PYTHONPATH=src:. $(PY) -m recallnotice.cli --incremental
+verdicts:
+	PYTHONPATH=src:. $(PY) -m recallnotice.cli --verdicts
 test:
 	PYTHONPATH=src:. $(PY) -m pytest -q
 mock:

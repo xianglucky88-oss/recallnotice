@@ -7,7 +7,7 @@ import json
 from lxml import html as _lh
 
 from .config import SPEC
-from .store import Store
+from .store import Store, SCHEMA_VERSION
 
 
 # --------------------------------------------------------------------------- #
@@ -163,14 +163,51 @@ def normalize(r):
     return d
 
 
-def _apply_kernel(records):
-    k = importlib.import_module(".kernel", __package__)
-    for r in records:
-        if hasattr(k, "process"):
-            r.update(k.process(r))
-    if hasattr(k, "reduce"):
-        records = k.reduce(records)
-    return records
+def _kernel():
+    return importlib.import_module(".kernel", __package__)
+
+
+def migrate_store(store):
+    """Bring a pre-adjudication database forward.
+
+    Historical rows were stored with kernel annotations baked into the
+    payload (and therefore into the content hash).  Strip derived fields so
+    identity reflects source content only; annotated duplicates of the same
+    announcement collapse onto a single row.  The historical payloads
+    themselves are preserved, and rows that are already raw are untouched.
+    """
+    if store.schema_version() >= SCHEMA_VERSION:
+        return 0
+    k = _kernel()
+    migrated = 0
+    for old_hash, payload in store.all_rows():
+        raw = k.strip_derived(payload)
+        if Store.hash(raw) == old_hash:
+            continue
+        store.delete(old_hash)
+        store.upsert(raw)
+        migrated += 1
+    store.set_schema_version(SCHEMA_VERSION)
+    return migrated
+
+
+def _adjudicate_store(store):
+    """Recompute verdicts over everything stored and persist them.
+
+    Adjudication is a pure function of the stored announcements, so full
+    and incremental collection, re-runs, out-of-order arrival and resumed
+    executions all converge to the same conclusions.
+    """
+    verdicts = _kernel().adjudicate(store.all_records())
+    store.replace_verdicts(verdicts)
+    return verdicts
+
+
+def _verdict_summary(verdicts):
+    out = {}
+    for v in verdicts:
+        out[v["state"]] = out.get(v["state"], 0) + 1
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -183,24 +220,31 @@ def run(mode="full", con=None):
     sleeper = Sleeper()
     http = Http(Transport(), sleeper)
     try:
+        migrate_store(store)
+        # Fetch everything before persisting anything: if the source is
+        # unavailable mid-collection, the stored state stays untouched and
+        # a later run simply resumes.
         records, attempts = fetch_all(http)
         norm = [normalize(dict(r)) for r in records]
         norm, dup_in_batch = dedup(norm)
-        norm = _apply_kernel(norm)
-
-        wm = store.watermark()
-        if mode == "incremental" and wm:
-            norm = [r for r in norm if str(r.get("ts", "")) > wm]
-
-        ingested = sum(1 for r in norm if store.upsert(r))
+        k = _kernel()
+        # Records are stored as raw source content; adjudication lives in
+        # the verdicts table, so re-annotation never splits a record's
+        # identity and re-runs are idempotent.  Content-hash dedup (not the
+        # watermark) decides what is new, which keeps late-arriving
+        # revisions ingestible in incremental mode.
+        ingested = sum(1 for r in norm if store.upsert(k.strip_derived(r)))
         total = store.count()
+        wm = store.watermark()
         new_wm = max([str(r.get("ts", "")) for r in norm] + [wm or ""])
         if new_wm:
             store.set_watermark(new_wm)
+        verdicts = _adjudicate_store(store)
         return {"engine": "crawl", "mode": mode, "fetched": len(records),
                 "duplicates": dup_in_batch, "ingested": ingested, "count": total,
                 "http_attempts": attempts, "slept": round(sleeper.slept, 4),
-                "watermark": store.watermark()}
+                "watermark": store.watermark(),
+                "verdicts": _verdict_summary(verdicts)}
     finally:
         if own:
             con.close()
@@ -279,12 +323,13 @@ def run_rpa(con=None):
     store = Store(con)
     r = Rpa()
     try:
+        migrate_store(store)
         logged = r.login()
         items = r.collect()
         norm = [normalize(dict(it)) for it in items]
         norm, dup = dedup(norm)
-        norm = _apply_kernel(norm)
-        ingested = sum(1 for x in norm if store.upsert(x))
+        k = _kernel()
+        ingested = sum(1 for x in norm if store.upsert(k.strip_derived(x)))
         total = store.count()
         created = dedup_submit = 0
         for x in norm[:2]:
@@ -298,10 +343,12 @@ def run_rpa(con=None):
         wm = max([str(x.get("ts", "")) for x in norm] + [""])
         if wm:
             store.set_watermark(wm)
+        verdicts = _adjudicate_store(store)
         return {"engine": "rpa", "logged_in": logged, "captcha_solved": r.captcha_solved,
                 "collected": len(items), "fetched": len(items), "duplicates": dup,
                 "ingested": ingested, "count": total,
-                "submit_created": created, "submit_dedup": dedup_submit, "log": r.log}
+                "submit_created": created, "submit_dedup": dedup_submit,
+                "verdicts": _verdict_summary(verdicts), "log": r.log}
     finally:
         if own:
             con.close()
